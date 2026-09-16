@@ -3,7 +3,7 @@
 import sys
 
 COMMANDS = {"bench": "scaling.benchmark", "sweep": "scaling.sweep",
-            "aggregate": "scaling.aggregate"}
+            "aggregate": "scaling.aggregate", "plot": "scaling.plot"}
 
 
 def main() -> int:

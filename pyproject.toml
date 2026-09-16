@@ -9,10 +9,17 @@ dependencies = [
     "torch>=2.1",
 ]
 
+# Plotting is not needed on the compute nodes, only where you make figures.
+[project.optional-dependencies]
+viz = [
+    "matplotlib>=3.7",
+]
+
 [project.scripts]
 scaling-bench = "scaling.benchmark:main"
 scaling-sweep = "scaling.sweep:main"
 scaling-aggregate = "scaling.aggregate:main"
+scaling-plot = "scaling.plot:main"
 
 [build-system]
 requires = ["hatchling"]

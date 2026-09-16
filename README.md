@@ -13,14 +13,18 @@ length vary independently, plus a SLURM sweep that walks one axis at a time.
 | [scaling/benchmark.py](scaling/benchmark.py) | One measurement: inference ms, training ms, peak training memory |
 | [scaling/sweep.py](scaling/sweep.py) | Emits the one-factor-at-a-time grid as JSONL |
 | [scaling/aggregate.py](scaling/aggregate.py) | Merges per-task results into a CSV / table |
+| [scaling/plot.py](scaling/plot.py) | The two trade-off figures, as PDF for LaTeX |
 | [scripts/sweep.slurm](scripts/sweep.slurm) | SLURM array job, one measurement per task |
 | [scripts/submit_sweep.sh](scripts/submit_sweep.sh) | Regenerates the config, sizes `--array`, submits |
 
 ## Install
 
 ```bash
-uv sync                     # or: pip install -e .
+uv sync --extra viz         # or: pip install -e '.[viz]'
 ```
+
+`viz` pulls in matplotlib, which only the machine that makes figures needs --
+the compute nodes just need torch, so plain `uv sync` is enough there.
 
 `requires-python` is `>=3.10,<3.13`: torch publishes no wheels for 3.14. On a
 cluster you will usually load the site torch module instead and just put the
@@ -114,6 +118,43 @@ One CSV row per run with the swept axis, its value, parameter count, GMACs, the
 three measurements and the GPU it ran on — ready to plot straight into the
 manuscript. Runs that OOM'd or errored are listed on stderr and kept in the CSV
 with their status.
+
+## Figures
+
+```bash
+python -m scaling.plot                       # results/sweep.csv -> results/figures/
+python -m scaling.plot --raw 'results/raw/*.jsonl'   # skip the CSV step
+python -m scaling.plot --theme dark --formats png    # for slides
+```
+
+Two figures, `time_vs_time.pdf` (inference time against training time) and
+`time_vs_memory.pdf` (training time against peak training memory), written as
+PDF for `\includegraphics` plus PNG for a quick look.
+
+Both are **small multiples**: one panel per scaling axis, that axis' trajectory
+highlighted in blue against every other run in gray. One panel with six coloured
+series is not an option -- in a scatter form any two marks can sit side by side,
+and the categorical palette carries only three series under that test. Emphasis
+plus context says the same thing without asking the reader to hold six hues.
+
+How to read a panel:
+
+- **Log-log**, so a power law `y = a x^k` is a straight line; the fitted `k` is
+  printed in each panel's corner.
+- The **dashed slope-1 guide** through the base configuration is the null
+  hypothesis: if a trajectory tracks it, that axis buys training cost strictly
+  in proportion to inference cost. Where it bends away, the axis is changing the
+  compute/memory balance -- which is the interesting part.
+- The **orange ring** marks the base configuration. It is shared by every axis,
+  so every trajectory passes through it.
+- Only the two **endpoints are labelled** with their swept value; the rest is on
+  the axis and in `results/sweep.csv`, which doubles as the table view.
+
+Panels share both scales, so a trajectory that is steeper than its neighbour
+really is steeper. Colours come from a palette validated for colour-vision
+deficiency in both themes (worst pair Delta-E 24.7 light / 26.8 dark against a
+target of 8); identity is carried by panel titles and position, never by colour
+alone.
 
 ## Tests
 
