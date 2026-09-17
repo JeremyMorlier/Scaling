@@ -20,6 +20,7 @@ scaling-bench = "scaling.benchmark:main"
 scaling-sweep = "scaling.sweep:main"
 scaling-aggregate = "scaling.aggregate:main"
 scaling-plot = "scaling.plot:main"
+scaling-cost = "scaling.analytic:main"
 
 [build-system]
 requires = ["hatchling"]
