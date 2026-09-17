@@ -7,7 +7,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from scaling.plot import fit_exponent, panels, trajectory  # noqa: E402
+from scaling.plot import (  # noqa: E402
+    MARKERS, THEMES, fit_exponent, make_overlay_figure, model_axes, panels,
+    trajectory,
+)
 
 ROWS = [
     {"model": "resnet50", "axis": "base", "swept_value": None,
@@ -60,6 +63,30 @@ def test_fit_exponent_recovers_a_known_power_law():
 
 def test_panels_are_in_reading_order_and_skip_absent_axes():
     assert panels(ROWS) == [("resnet50", "width_mult"), ("resnet50", "resolution")]
+
+
+def test_model_axes_follows_the_declared_order():
+    assert model_axes(ROWS, "resnet50") == ["width_mult", "resolution"]
+    assert model_axes(ROWS, "vit_small") == []
+
+
+def test_ramp_covers_the_widest_model_and_matches_the_markers():
+    # ViT-S has four axes; superposing them needs four validated slots, each
+    # with its own marker shape as the colour-independent identity channel.
+    from scaling.models import MODEL_AXES
+    widest = max(len(a) for a in MODEL_AXES.values())
+    for name, theme in THEMES.items():
+        assert len(theme.ramp) >= widest, name
+        assert len(set(theme.ramp)) == len(theme.ramp), f"{name} repeats a hue"
+    assert len(MARKERS) >= widest
+
+
+def test_overlay_figure_builds_and_skips_absent_models():
+    fig = make_overlay_figure(ROWS, "resnet50", THEMES["light"])
+    assert fig is not None
+    # Only the time panel is possible: these rows carry no memory column.
+    assert len(fig.axes) == 1
+    assert make_overlay_figure(ROWS, "vit_small", THEMES["light"]) is None
 
 
 if __name__ == "__main__":

@@ -14,6 +14,7 @@ length vary independently, plus a SLURM sweep that walks one axis at a time.
 | [scaling/sweep.py](scaling/sweep.py) | Emits the one-factor-at-a-time grid as JSONL |
 | [scaling/aggregate.py](scaling/aggregate.py) | Merges per-task results into a CSV / table |
 | [scaling/plot.py](scaling/plot.py) | The two trade-off figures, as PDF for LaTeX |
+| [scripts/run_all.py](scripts/run_all.py) | **Everything on one machine**, batch size is the only argument |
 | [scripts/sweep.slurm](scripts/sweep.slurm) | SLURM array job, one measurement per task |
 | [scripts/submit_sweep.sh](scripts/submit_sweep.sh) | Regenerates the config, sizes `--array`, submits |
 
@@ -29,6 +30,19 @@ the compute nodes just need torch, so plain `uv sync` is enough there.
 `requires-python` is `>=3.10,<3.13`: torch publishes no wheels for 3.14. On a
 cluster you will usually load the site torch module instead and just put the
 repo root on `PYTHONPATH`.
+
+Every entry point runs three ways, so an editor's run button works as well as
+the command line:
+
+```bash
+python -m scaling.sweep --count     # as a module (what the SLURM script uses)
+python main.py sweep --count        # via the dispatcher
+python scaling/sweep.py --count     # straight at the file
+```
+
+The last one needs no `PYTHONPATH`: each runnable module puts the repo root on
+the path itself when it finds it has no parent package. Relative output paths
+are still resolved against the current directory, so run from the repo root.
 
 ## Models
 
@@ -48,6 +62,32 @@ fully convolutional with a global pool, so any value works.
 image resolution is derived from it as `sqrt(num_patches) * patch_size`, so the
 model still consumes a real image tensor rather than synthetic tokens. It must
 be a perfect square; the error message suggests the nearest valid values.
+
+## Everything at once
+
+On a single GPU (an interactive `srun`, a workstation, one node), this is the
+whole study in one command -- the batch size is the only thing you supply:
+
+```bash
+python scripts/run_all.py 128
+```
+
+It generates the sweep, measures every configuration, merges the results and
+writes the figures:
+
+```
+configs/sweep.jsonl -> results/raw/local.jsonl -> results/sweep.csv -> results/figures/*.pdf
+```
+
+Each configuration runs in its own subprocess, exactly as the SLURM array does:
+one code path for both, a fresh CUDA context per measurement, and a run that
+segfaults or gets OOM-killed costs one data point instead of the whole sweep.
+It **resumes by default**, so re-running after an interruption only measures
+what is missing; `--fresh` starts over. `--models resnet50` restricts the sweep
+and `--device cpu` gives a (slow, memory-free) smoke test.
+
+For the cluster, use `scripts/submit_sweep.sh` instead -- same work, in
+parallel. The sections below are the individual steps, should you want them.
 
 ## Measuring one configuration
 
@@ -127,15 +167,20 @@ python -m scaling.plot --raw 'results/raw/*.jsonl'   # skip the CSV step
 python -m scaling.plot --theme dark --formats png    # for slides
 ```
 
-Two figures, `time_vs_time.pdf` (inference time against training time) and
-`time_vs_memory.pdf` (training time against peak training memory), written as
-PDF for `\includegraphics` plus PNG for a quick look.
+Four figures, as PDF for `\includegraphics` plus PNG for a quick look:
 
-Both are **small multiples**: one panel per scaling axis, that axis' trajectory
-highlighted in blue against every other run in gray. One panel with six coloured
-series is not an option -- in a scatter form any two marks can sit side by side,
-and the categorical palette carries only three series under that test. Emphasis
-plus context says the same thing without asking the reader to hold six hues.
+| File | What it shows |
+| --- | --- |
+| `<model>_axes.pdf` | **One model, every axis superposed** -- both relationships side by side |
+| `time_vs_time.pdf` | Inference time against training time, one panel per axis |
+| `time_vs_memory.pdf` | Training time against peak training memory, one panel per axis |
+
+The `<model>_axes` pair is the comparison figure: all of a model's scaling axes
+drawn on the same pair of panels, so you can see directly where they diverge.
+The other two are the per-axis detail views -- **small multiples**, one panel per
+axis, that axis highlighted in blue against every other run in gray.
+
+Use `--figures overlay` (or `time` / `memory`) to render a subset.
 
 How to read a panel:
 
@@ -145,16 +190,25 @@ How to read a panel:
   hypothesis: if a trajectory tracks it, that axis buys training cost strictly
   in proportion to inference cost. Where it bends away, the axis is changing the
   compute/memory balance -- which is the interesting part.
-- The **orange ring** marks the base configuration. It is shared by every axis,
+- The **neutral ring** marks the base configuration. It is shared by every axis,
   so every trajectory passes through it.
-- Only the two **endpoints are labelled** with their swept value; the rest is on
-  the axis and in `results/sweep.csv`, which doubles as the table view.
+- In the superposed figures each trajectory is **labelled at its end** and the
+  legend carries that panel's fitted `k`; in the small multiples the two
+  **endpoints are labelled** with their swept value. The rest is on the axis and
+  in `results/sweep.csv`, which doubles as the table view.
 
-Panels share both scales, so a trajectory that is steeper than its neighbour
-really is steeper. Colours come from a palette validated for colour-vision
-deficiency in both themes (worst pair Delta-E 24.7 light / 26.8 dark against a
-target of 8); identity is carried by panel titles and position, never by colour
-alone.
+In the small multiples panels share both scales, so a trajectory steeper than its
+neighbour really is steeper.
+
+On colour: superposing ViT-S needs four distinguishable series, and in a form
+where any two marks can sit side by side the default slot order only carries
+three. Enumerating all 70 four-hue subsets of the palette against that test in
+both themes leaves exactly two survivors; `scaling/plot.py` uses the one that
+keeps the leading blue. Its two conditional warnings -- dark-mode CVD Delta-E 6.9,
+and yellow/magenta under 3:1 on the light surface -- are legal only with
+secondary encoding, which is why every trajectory also carries its own marker
+shape and a direct end label. Identity never rests on colour alone, so the
+figures survive greyscale printing and colour-vision deficiency.
 
 ## Tests
 

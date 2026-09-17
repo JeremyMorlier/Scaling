@@ -25,6 +25,17 @@ from typing import Any, Callable, Iterable
 import torch
 import torch.nn as nn
 
+# Running a package module straight from an editor ("python scaling/sweep.py")
+# leaves it without a parent package, so the relative imports below fail. Put
+# the repo root on the path and name the package, so both that and the
+# supported "python -m scaling.sweep" work.
+if __package__ in (None, ""):
+    import pathlib as _pathlib
+    import sys as _sys
+
+    _sys.path.insert(0, str(_pathlib.Path(__file__).resolve().parents[1]))
+    __package__ = "scaling"
+
 from .models import MODEL_AXES, build_model
 
 AMP_DTYPES = {"none": None, "fp16": torch.float16, "bf16": torch.bfloat16}
