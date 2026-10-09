@@ -11,10 +11,12 @@ length vary independently, plus a SLURM sweep that walks one axis at a time.
 | [scaling/models/resnet.py](scaling/models/resnet.py) | ResNet-50, uniform channel multiplier + configurable input resolution |
 | [scaling/models/vit.py](scaling/models/vit.py) | ViT-S, configurable `embed_dim` / `depth` / `mlp_dim` / `num_patches` |
 | [scaling/benchmark.py](scaling/benchmark.py) | One measurement: inference ms, training ms, peak training memory |
+| [scaling/analytic.py](scaling/analytic.py) | Closed-form FLOPs and training memory, no forward pass, no GPU |
 | [scaling/sweep.py](scaling/sweep.py) | Emits the one-factor-at-a-time grid as JSONL |
 | [scaling/aggregate.py](scaling/aggregate.py) | Merges per-task results into a CSV / table |
 | [scaling/plot.py](scaling/plot.py) | The two trade-off figures, as PDF for LaTeX |
 | [scripts/run_all.py](scripts/run_all.py) | **Everything on one machine**, batch size is the only argument |
+| [scripts/analytic_all.py](scripts/analytic_all.py) | **The same study in closed form**, no GPU, one second |
 | [scripts/sweep.slurm](scripts/sweep.slurm) | SLURM array job, one measurement per task |
 | [scripts/submit_sweep.sh](scripts/submit_sweep.sh) | Regenerates the config, sizes `--array`, submits |
 
@@ -62,6 +64,152 @@ fully convolutional with a global pool, so any value works.
 image resolution is derived from it as `sqrt(num_patches) * patch_size`, so the
 model still consumes a real image tensor rather than synthetic tokens. It must
 be a perfect square; the error message suggests the nearest valid values.
+
+## Cost without running anything
+
+[scaling/analytic.py](scaling/analytic.py) computes the same quantities in
+closed form, straight from the configuration. A point that would OOM costs no
+more to evaluate than one that fits, which is what extrapolating a scaling law
+needs.
+
+```bash
+python -m scaling.analytic --model resnet50 --batch-size 64
+python -m scaling.analytic --model vit_small --set depth=24 --batch-size 256 --group
+python -m scaling.analytic --model resnet50 --set width_mult=4 --json
+```
+
+```
+resnet50  width_mult=1.0 resolution=224
+input 64x3x224x224   optimizer=sgd_momentum  params=fp32 activations=fp32
+
+  parameters               25,557,032      97.49 MiB
+  buffers (BN)                 53,173       0.20 MiB
+
+compute, per image
+  forward                4.089 GMACs      8.178 GFLOPs
+  backward               8.060 GMACs     16.121 GFLOPs
+  training step         12.150 GMACs     24.299 GFLOPs   (2.97x forward)
+
+training memory, batch 64
+  parameters               97.49 MiB
+  gradients                97.49 MiB
+  optimizer state          97.49 MiB   (1 x params)
+  BN buffers                0.20 MiB
+  saved activations      5109.20 MiB   (20,926,440 elems/img)
+  argmax indices           98.00 MiB
+  input batch              36.75 MiB
+  ----------------------------------
+  total                  5536.63 MiB
+```
+
+Three conventions, all per image:
+
+- **FLOPs** counts matmul-class MACs only (conv, linear, attention) — the
+  convention behind "4.1 GMACs for ResNet-50" and the one `FlopCounterMode`
+  uses. Normalisations, GELU and residual adds are reported separately as
+  `elementwise`: they cost bandwidth, not multipliers.
+- **Backward** is twice the forward for a weighted op (one matmul for the input
+  gradient, one for the weight gradient), except at the layer that touches the
+  image, whose input gradient is never needed. A training step is therefore
+  2.97x the forward, not exactly 3x.
+- **Saved activations** are the tensors autograd keeps from the forward until
+  the backward consumes them, counted per *distinct storage*. This is where an
+  analytic model usually goes wrong and the reason it is worth having:
+  `relu(inplace=True)` saves the batch-norm buffer it overwrote rather than a
+  new one, `q/k/v` are strided views of one `qkv` tensor, a `reshape` of the
+  transposed attention output is free, and `bn3` and the downsample branch feed
+  only the residual add, so their outputs die immediately. Flash attention
+  keeps a per-row log-sum-exp and recomputes the scores, so ViT memory is
+  linear in the sequence length — `--attn-impl math` shows the quadratic
+  alternative.
+
+Flags: `--optimizer sgd|sgd_momentum|adam|adamw` (how many parameter-sized
+buffers to charge), `--act-dtype bf16` for an autocast run (activations halve,
+weights and optimizer state do not), `--images N` to turn the per-step cost
+into a training budget, `--table`/`--group` for the per-op breakdown, `--json`.
+
+### Is it right?
+
+Every term has a ground truth, and `--verify` builds the model and checks
+against it: parameters from the module, MACs from `FlopCounterMode`, saved
+activations from `saved_tensors_hooks` deduplicated by storage. It agrees
+**exactly**, on CPU, at any batch size — that is what
+[tests/test_analytic.py](tests/test_analytic.py) asserts.
+
+```bash
+python -m scaling.analytic --model vit_small --verify
+```
+
+Against the real thing, `--compare` puts the model next to a measured sweep:
+
+```bash
+python -m scaling.analytic --compare results/sweep.csv
+```
+
+Parameters and MACs match to the digit. Predicted training memory lands within
+a few percent of `max_memory_allocated` on an A100 across all 43 runs, low only
+where the configuration is small enough for the CUDA context to dominate. The
+sum of the terms *models* the peak rather than bounding it: the backward also
+holds activation gradients and cuDNN workspaces, while
+`zero_grad(set_to_none=True)` means the gradients are not live during the
+forward.
+
+The inference figure is deliberately weaker — weights plus the largest live
+pair of tensors, a floor. Measured inference peak is set by the workspaces
+`cudnn.benchmark` picks, which no closed form predicts.
+
+### The whole sweep, analytically
+
+```bash
+python scripts/analytic_all.py 64
+```
+
+The counterpart of `run_all.py`: same one-factor-at-a-time grid, same run ids,
+but costed instead of measured, then plotted. No GPU, no subprocesses, about a
+second.
+
+```
+configs/sweep.jsonl (the same grid) -> results/analytic.csv -> results/figures/*.pdf
+```
+
+The figures land beside the measured ones and never overwrite them — the stems
+differ (`flops_vs_flops`, `flops_vs_memory`, `params_vs_memory`,
+`<model>_axes_analytic`). When `results/sweep.csv` exists the run ends with the
+two tables side by side, so you can see how far the model is from the machine.
+
+| Figure | What it shows |
+| --- | --- |
+| `<model>_axes_analytic.pdf` | One model, every axis superposed, three panels |
+| `flops_vs_flops.pdf` | Training arithmetic against inference arithmetic |
+| `flops_vs_memory.pdf` | Training memory against training arithmetic |
+| `params_vs_memory.pdf` | **Training memory against parameter count** |
+
+The first figure is the null result worth having: training FLOPs sit at
+`k = 1.00` above inference FLOPs on every axis of both models, because the
+backward is 2x the forward whatever you scale. All the curvature in the
+*measured* time-vs-time figure is therefore hardware — arithmetic intensity,
+kernel choice, occupancy — and none of it is arithmetic.
+
+The last one is the other side of that coin: along `resolution` (ResNet) and
+`num_patches` (ViT) the trajectory is a **vertical line**, an order of magnitude
+of training memory at a parameter count that does not move. Those panels carry
+no fitted exponent, because a power law across a 0.6% x-range is a number about
+the range, not about the model.
+
+Flags mirror the cost command — `--optimizer`, `--act-dtype bf16`,
+`--attn-impl`, `--models`, `--theme dark`, `--formats png` — plus `--csv` and
+`--out-dir`. Since nothing is executed, the natural next step is to widen
+`SWEEP_VALUES` in [scaling/sweep.py](scaling/sweep.py) past what any GPU here
+could hold: the extra points cost nothing and the figures extend straight
+through them.
+
+To drive the two halves by hand, the CSV is plain:
+
+```bash
+python -m scaling.analytic --sweep-csv results/analytic.csv --batch-size 64
+python -m scaling.plot --csv results/analytic.csv --figures overlay flops_memory
+```
+
 
 ## Everything at once
 
@@ -180,7 +328,10 @@ drawn on the same pair of panels, so you can see directly where they diverge.
 The other two are the per-axis detail views -- **small multiples**, one panel per
 axis, that axis highlighted in blue against every other run in gray.
 
-Use `--figures overlay` (or `time` / `memory`) to render a subset.
+Use `--figures overlay` (or `time` / `memory`) to render a subset. The analytic
+kinds (`flops`, `flops_memory`, `params_memory`) go through the same command and
+are described under [Cost without running anything](#cost-without-running-anything);
+whichever kinds the CSV has no columns for are skipped.
 
 How to read a panel:
 

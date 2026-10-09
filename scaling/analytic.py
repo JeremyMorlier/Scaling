@@ -733,6 +733,91 @@ def format_summary(cost: ModelCost, batch_size: int,
 
 
 # --------------------------------------------------------------------------- #
+# the whole sweep, analytically
+# --------------------------------------------------------------------------- #
+
+#: Columns of the analytic sweep CSV.  The identity columns are spelled exactly
+#: as :mod:`scaling.aggregate` spells them, so the analytic and measured tables
+#: line up run for run and plot through the same code.
+SWEEP_COLUMNS = [
+    "run_id", "model", "axis", "swept_value", "status", "batch_size",
+    "params", "resolution", "seq_len", "num_heads",
+    "fwd_macs_per_image", "fwd_gflops_per_image", "bwd_gflops_per_image",
+    "train_gflops_per_image", "train_gflops_per_step",
+    "saved_act_elems_per_image", "act_mem_mib", "weights_mem_mib",
+    "train_mem_mib", "infer_mem_floor_mib",
+    "optimizer", "param_dtype", "act_dtype", "source",
+]
+
+
+def sweep_rows(models: list[str] | None = None, batch_size: int = 64,
+               optimizer: str = "sgd_momentum", param_dtype: str = "fp32",
+               act_dtype: str = "fp32", attn_impl: str = "flash",
+               num_classes: int = 1000) -> list[dict[str, Any]]:
+    """Cost every configuration of the one-factor-at-a-time grid.
+
+    The grid comes from :func:`scaling.sweep.generate`, the same one the
+    measured sweep walks, so run ids match and the two tables are directly
+    comparable.  To cost configurations no GPU here could hold, widen
+    ``SWEEP_VALUES`` in :mod:`scaling.sweep`: nothing is executed, so the extra
+    points are free.
+    """
+    from .sweep import generate
+
+    rows: list[dict[str, Any]] = []
+    for run in generate(models=models, batch_size=batch_size):
+        params = dict(run["params"])
+        if run["model"] == "vit_small":
+            params["attn_impl"] = attn_impl
+        cost = model_cost(run["model"], num_classes=num_classes, **params)
+        mem = cost.memory(batch_size, optimizer=optimizer,
+                          param_dtype=param_dtype, act_dtype=act_dtype)
+        axis = run["axis"]
+        rows.append({
+            "run_id": run["run_id"],
+            "model": run["model"],
+            "axis": axis,
+            # As in the measured CSV: at the base point every axis sits at its
+            # base value, so there is no single swept value to report.
+            "swept_value": run["params"].get(axis) if axis != "base" else "",
+            "status": "ok",
+            "batch_size": batch_size,
+            "params": cost.params,
+            "resolution": cost.config["resolution"],
+            "seq_len": cost.config.get("seq_len", ""),
+            "num_heads": cost.config.get("num_heads", ""),
+            "fwd_macs_per_image": cost.fwd_macs,
+            "fwd_gflops_per_image": cost.fwd_flops / 1e9,
+            "bwd_gflops_per_image": 2 * cost.bwd_macs / 1e9,
+            "train_gflops_per_image": cost.train_flops / 1e9,
+            "train_gflops_per_step": cost.train_flops * batch_size / 1e9,
+            "saved_act_elems_per_image": cost.saved_elems,
+            "act_mem_mib": mem.activations_total / MIB,
+            "weights_mem_mib": mem.weights_total / MIB,
+            "train_mem_mib": mem.total / MIB,
+            "infer_mem_floor_mib": cost.inference_bytes(batch_size, act_dtype) / MIB,
+            "optimizer": optimizer,
+            "param_dtype": param_dtype,
+            "act_dtype": act_dtype,
+            "source": "analytic",
+        })
+    return rows
+
+
+def write_sweep_csv(path: str, rows: list[dict[str, Any]]) -> None:
+    import csv
+    import os
+
+    directory = os.path.dirname(os.path.abspath(path))
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    with open(path, "w", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=SWEEP_COLUMNS)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+# --------------------------------------------------------------------------- #
 # comparison against a measured sweep
 # --------------------------------------------------------------------------- #
 
@@ -820,6 +905,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--verify-device", default="cpu")
     p.add_argument("--compare", metavar="CSV",
                    help="tabulate against a measured sweep CSV")
+    p.add_argument("--sweep-csv", metavar="CSV",
+                   help="cost the whole one-factor-at-a-time grid into this CSV, "
+                        "ready for scaling.plot")
+    p.add_argument("--models", nargs="*", choices=sorted(MODEL_AXES),
+                   help="restrict --sweep-csv to these architectures")
     return p
 
 
@@ -828,6 +918,14 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.compare:
         print(compare_csv(args.compare, optimizer=args.optimizer))
+        return 0
+    if args.sweep_csv:
+        rows = sweep_rows(models=args.models, batch_size=args.batch_size,
+                          optimizer=args.optimizer, param_dtype=args.param_dtype,
+                          act_dtype=args.act_dtype, attn_impl=args.attn_impl,
+                          num_classes=args.num_classes)
+        write_sweep_csv(args.sweep_csv, rows)
+        print(f"wrote {len(rows)} configurations to {args.sweep_csv}")
         return 0
     if not args.model:
         raise SystemExit("--model is required (or use --compare CSV)")

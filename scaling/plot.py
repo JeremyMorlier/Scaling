@@ -1,9 +1,16 @@
-"""Figures for the sweep: inference vs training time, training time vs memory.
+"""Figures for the sweep, measured or analytic.
+
+Measured (from ``scaling.aggregate``): inference vs training time, training
+time vs memory.  Analytic (from ``scaling.analytic --sweep-csv``): the same
+shapes with arithmetic in place of seconds, plus parameters against memory --
+the figure that shows a parameter count does not predict what a training step
+costs.  Both tables carry the same identity columns, so one code path draws
+either; each figure simply skips the panels whose columns the table lacks.
 
 Design notes
 ------------
-Both figures are **small multiples**: one panel per scaling axis, each panel
-showing that axis' trajectory highlighted against every other run in gray.
+Every figure comes as **small multiples**: one panel per scaling axis, each
+panel showing that axis' trajectory highlighted against every other run in gray.
 The alternative -- one panel with six coloured series -- is not available: in a
 scatter/small-multiple form any two marks can sit side by side, and the
 categorical palette only carries three series under that all-pairs test.
@@ -113,7 +120,31 @@ FIGURES = {
         "title": "Training memory against training time",
         "stem": "time_vs_memory",
     },
+    "flops": {
+        "x": ("fwd_gflops_per_image", "inference FLOPs per image (G)"),
+        "y": ("train_gflops_per_image", "training FLOPs per image (G)"),
+        "title": "Training arithmetic against inference arithmetic",
+        "stem": "flops_vs_flops",
+    },
+    "flops_memory": {
+        "x": ("train_gflops_per_step", "training FLOPs per step (G)"),
+        "y": ("train_mem_mib", "training memory (MiB)"),
+        "title": "Training memory against training arithmetic",
+        "stem": "flops_vs_memory",
+    },
+    "params_memory": {
+        "x": ("params", "parameters"),
+        "y": ("train_mem_mib", "training memory (MiB)"),
+        "title": "Training memory against parameter count",
+        "stem": "params_vs_memory",
+    },
 }
+
+#: Kinds that belong to one table.  A measured CSV has no FLOPs columns and an
+#: analytic one has no milliseconds, so the default selection is simply
+#: everything -- the empty half drops out on its own.
+MEASURED = ("time", "memory")
+ANALYTIC = ("flops", "flops_memory", "params_memory")
 
 
 # --------------------------------------------------------------------------- #
@@ -139,16 +170,29 @@ def load_rows(path: str, raw: bool = False) -> list[dict[str, Any]]:
         with open(path, newline="") as fh:
             rows = list(csv.DictReader(fh))
 
+    # Every column any figure plots, so adding a figure needs no change here.
+    numeric = {"swept_value", "params", "fwd_macs_per_image"}
+    numeric |= {spec[side][0] for spec in FIGURES.values() for side in ("x", "y")}
+
     out = []
     for row in rows:
         if row.get("status") != "ok":
             continue
         row = dict(row)
-        for key in ("swept_value", "infer_ms_median", "train_ms_median",
-                    "train_peak_mem_mib", "params", "fwd_macs_per_image"):
+        for key in numeric:
             row[key] = _num(row.get(key))
         out.append(row)
     return out
+
+
+def provenance(rows: list[dict[str, Any]]) -> str:
+    """What produced these numbers, for the figure subtitle."""
+    if rows and rows[0].get("source") == "analytic":
+        detail = ", ".join(filter(None, [
+            rows[0].get("optimizer", ""),
+            f"activations {rows[0]['act_dtype']}" if rows[0].get("act_dtype") else ""]))
+        return " · analytic (" + detail + ")" if detail else " · analytic"
+    return f" · {rows[0]['gpu_name']}" if rows and rows[0].get("gpu_name") else ""
 
 
 def panels(rows: list[dict[str, Any]]) -> list[tuple[str, str]]:
@@ -185,10 +229,17 @@ def trajectory(rows: list[dict[str, Any]], model: str, axis: str,
     return sorted(points)
 
 
-def fit_exponent(xs: Iterable[float], ys: Iterable[float]) -> float | None:
-    """Slope of log(y) against log(x): the power-law exponent k in y ~ x^k."""
+def fit_exponent(xs: Iterable[float], ys: Iterable[float],
+                 min_span: float = 1.1) -> float | None:
+    """Slope of log(y) against log(x): the power-law exponent k in y ~ x^k.
+
+    ``min_span`` is the factor the x values must cover before a slope means
+    anything.  Sequence length moves a ViT's parameter count by well under a
+    percent while its memory triples, and fitting those together reports an
+    exponent in the hundreds -- a number about the x-range, not the model.
+    """
     xs, ys = np.asarray(list(xs), float), np.asarray(list(ys), float)
-    if len(xs) < 3 or np.ptp(np.log(xs)) < 1e-6:
+    if len(xs) < 3 or np.ptp(np.log(xs)) < math.log(min_span):
         return None
     return float(np.polyfit(np.log(xs), np.log(ys), 1)[0])
 
@@ -205,6 +256,19 @@ def _minor_tick(value: float, _pos: int) -> str:
 # --------------------------------------------------------------------------- #
 # rendering
 # --------------------------------------------------------------------------- #
+
+def _header(fig, title: str, sub: str, theme: Theme) -> None:
+    """Flush-left title and subtitle, pinned a fixed distance from the top.
+
+    Figure fractions would put them closer together on every extra row of
+    panels, until the title's descenders strike through the subtitle.
+    """
+    height = fig.get_size_inches()[1]
+    fig.suptitle(title, x=0.008, y=1 - 0.02 / height, ha="left", va="top",
+                 fontsize=11.5, color=theme.text_primary)
+    fig.text(0.008, 1 - 0.23 / height, sub, ha="left", va="top", fontsize=8,
+             color=theme.text_muted)
+
 
 def _style(theme: Theme) -> None:
     plt.rcParams.update({
@@ -395,7 +459,8 @@ def _draw_overlay_panel(ax, rows, model, axes, xk, yk, theme):
     return True, handles, [(a, x, y, c) for a, c, _m, x, y in drawn]
 
 
-def make_overlay_figure(rows: list[dict[str, Any]], model: str, theme: Theme):
+def make_overlay_figure(rows: list[dict[str, Any]], model: str, theme: Theme,
+                        kinds: Iterable[str] = MEASURED):
     """One model, every scaling axis superposed, one panel per relationship."""
     from matplotlib.lines import Line2D
 
@@ -403,16 +468,23 @@ def make_overlay_figure(rows: list[dict[str, Any]], model: str, theme: Theme):
     if not axes_names:
         return None
 
-    kinds = [k for k in ("time", "memory")
+    kinds = [k for k in kinds
              if any(trajectory(rows, model, a, FIGURES[k]["x"][0],
                                FIGURES[k]["y"][0]) for a in axes_names)]
     if not kinds:
         return None
 
-    fig, panels_ = plt.subplots(1, len(kinds), figsize=(5.0 * len(kinds), 4.3),
-                                squeeze=False)
+    # Two panels side by side read as a pair; a third would make the figure too
+    # wide for a page, so wrap instead.
+    ncols = min(2, len(kinds))
+    nrows = math.ceil(len(kinds) / ncols)
+    fig, grid = plt.subplots(nrows, ncols, figsize=(5.0 * ncols, 4.3 * nrows),
+                             squeeze=False)
+    flat = grid.ravel()
+    for ax in flat[len(kinds):]:
+        ax.set_visible(False)
     pending = []
-    for ax, kind in zip(panels_[0], kinds):
+    for ax, kind in zip(flat, kinds):
         spec = FIGURES[kind]
         ok, handles, ends = _draw_overlay_panel(ax, rows, model, axes_names,
                                                 spec["x"][0], spec["y"][0], theme)
@@ -427,13 +499,10 @@ def make_overlay_figure(rows: list[dict[str, Any]], model: str, theme: Theme):
                       labelcolor=theme.text_secondary, handlelength=1.9,
                       borderpad=0.6, labelspacing=0.5)
 
-    fig.suptitle(f"{MODEL_LABELS.get(model, model)}: every scaling axis superposed",
-                 x=0.008, y=0.995, ha="left", fontsize=11.5,
-                 color=theme.text_primary)
-    sub = ("log-log · $k$ is the fitted exponent of $y \\propto x^{k}$ · "
-           f"batch size {rows[0].get('batch_size', '?')}"
-           + (f" · {rows[0]['gpu_name']}" if rows[0].get("gpu_name") else ""))
-    fig.text(0.008, 0.945, sub, ha="left", fontsize=8, color=theme.text_muted)
+    _header(fig, f"{MODEL_LABELS.get(model, model)}: every scaling axis superposed",
+            "log-log · $k$ is the fitted exponent of $y \\propto x^{k}$ · "
+            f"batch size {rows[0].get('batch_size', '?')}" + provenance(rows),
+            theme)
 
     furniture = [
         Line2D([], [], color="none", marker="o", ms=9.0, mfc="none",
@@ -445,7 +514,10 @@ def make_overlay_figure(rows: list[dict[str, Any]], model: str, theme: Theme):
     fig.legend(handles=furniture, loc="lower center", ncol=2,
                bbox_to_anchor=(0.5, 0.0), handlelength=2.2,
                labelcolor=theme.text_secondary, columnspacing=1.8)
-    fig.tight_layout(rect=(0, 0.07, 1, 0.93))
+    # Reserve the header and the bottom legend in inches, not fractions: both
+    # are a fixed height however many rows of panels sit between them.
+    height = fig.get_size_inches()[1]
+    fig.tight_layout(rect=(0, 0.30 / height, 1, 1 - 0.40 / height))
     # Labels go on last: their placement is computed in display pixels, which
     # tight_layout would otherwise invalidate.
     fig.canvas.draw()
@@ -512,15 +584,14 @@ def make_figure(rows: list[dict[str, Any]], kind: str, theme: Theme,
             visible[-1].set_xlabel(xlabel)
             visible[-1].tick_params(labelbottom=True)
 
-    fig.suptitle(spec["title"], x=0.008, y=0.995, ha="left",
-                 fontsize=11.5, color=theme.text_primary)
-    sub = (f"one panel per scaling axis · log-log · "
-           f"batch size {rows[0].get('batch_size', '?')}"
-           + (f" · {rows[0]['gpu_name']}" if rows[0].get("gpu_name") else ""))
-    fig.text(0.008, 0.958, sub, ha="left", fontsize=8, color=theme.text_muted)
+    _header(fig, spec["title"],
+            "one panel per scaling axis · log-log · "
+            f"batch size {rows[0].get('batch_size', '?')}" + provenance(rows),
+            theme)
 
     _legend(fig, theme)
-    fig.tight_layout(rect=(0, 0.055, 1, 0.945))
+    height = fig.get_size_inches()[1]
+    fig.tight_layout(rect=(0, 0.34 / height, 1, 1 - 0.40 / height))
     return fig
 
 
@@ -540,8 +611,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--figures", nargs="+",
                    choices=sorted(FIGURES) + ["overlay"],
                    default=sorted(FIGURES) + ["overlay"],
-                   help="'time'/'memory' are the per-axis small multiples; "
-                        "'overlay' superposes every axis of one model")
+                   help="time/memory (measured) and flops/flops_memory/"
+                        "params_memory (analytic) are the per-axis small "
+                        "multiples; 'overlay' superposes every axis of one "
+                        "model.  Kinds the table has no columns for are skipped")
     p.add_argument("--ncols", type=int, default=3)
     args = p.parse_args(argv)
 
@@ -567,20 +640,28 @@ def main(argv: list[str] | None = None) -> int:
 
     written = 0
     if "overlay" in args.figures:
+        # One overlay per table: the measured pair, or the analytic set.  Asking
+        # for the overlay alone means all of that table's panels.
+        group = ANALYTIC if rows[0].get("source") == "analytic" else MEASURED
+        # The group's own order, not the alphabetical order --figures arrives in.
+        selected = [k for k in group if k in args.figures]
+        kinds = selected or list(group)
+        analytic = group is ANALYTIC
+        suffix = "_analytic" if analytic else ""
         for model in sorted({r["model"] for r in rows}):
-            fig = make_overlay_figure(rows, model, theme)
+            fig = make_overlay_figure(rows, model, theme, kinds=kinds)
             if fig is None:
                 print(f"skipping overlay for {model}: no usable trajectory",
                       file=sys.stderr)
                 continue
-            written += save(fig, f"{model}_axes")
+            written += save(fig, f"{model}_axes{suffix}")
 
     for kind in [k for k in args.figures if k != "overlay"]:
         fig = make_figure(rows, kind, theme, ncols=args.ncols)
         if fig is None:
-            missing = FIGURES[kind]["y"][0]
-            print(f"skipping '{kind}' figure: no run has {missing} "
-                  "(memory is only recorded on CUDA)", file=sys.stderr)
+            spec = FIGURES[kind]
+            print(f"skipping '{kind}' figure: {source} has no "
+                  f"{spec['x'][0]}/{spec['y'][0]} column", file=sys.stderr)
             continue
         written += save(fig, FIGURES[kind]["stem"])
 

@@ -17,8 +17,9 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from scaling.analytic import (DTYPE_BYTES, OPTIMIZER_STATES, model_cost,
-                              resnet50_cost, verify, vit_cost)
+from scaling.analytic import (DTYPE_BYTES, OPTIMIZER_STATES, SWEEP_COLUMNS,
+                              model_cost, resnet50_cost, sweep_rows, verify,
+                              vit_cost, write_sweep_csv)
 
 # Batch 2 at least: batch-norm refuses a single sample per channel in training,
 # and the activation terms have to be linear in the batch to be worth checking.
@@ -115,6 +116,40 @@ def test_model_cost_rejects_axes_the_model_does_not_have():
     with pytest.raises(ValueError):
         model_cost("resnet101")
     assert model_cost("vit_small", depth=6).config["depth"] == 6
+
+
+def test_the_analytic_sweep_covers_the_measured_grid_run_for_run():
+    from scaling.sweep import generate
+
+    rows = sweep_rows(batch_size=8)
+    assert [r["run_id"] for r in rows] == [r["run_id"] for r in generate()]
+    assert all(r["status"] == "ok" for r in rows)
+    # Base rows report no swept value, exactly as scaling.aggregate writes them.
+    assert all((r["swept_value"] == "") == (r["axis"] == "base") for r in rows)
+    base = next(r for r in rows if r["run_id"] == "resnet50__base")
+    assert base["params"] == 25_557_032
+    assert base["fwd_macs_per_image"] == 4_089_184_256
+    assert base["train_gflops_per_step"] == pytest.approx(
+        base["train_gflops_per_image"] * 8)
+
+
+def test_the_sweep_csv_is_readable_by_the_plotter(tmp_path):
+    import csv
+
+    path = tmp_path / "analytic.csv"
+    write_sweep_csv(str(path), sweep_rows(models=["resnet50"], batch_size=4))
+    with open(path, newline="") as fh:
+        rows = list(csv.DictReader(fh))
+    assert [*rows[0]] == SWEEP_COLUMNS
+    assert all(float(r["train_mem_mib"]) > 0 for r in rows)
+
+    from scaling.plot import ANALYTIC, FIGURES, load_rows
+    loaded = load_rows(str(path))
+    assert len(loaded) == len(rows)
+    # Every analytic figure must find both of its columns as numbers.
+    for kind in ANALYTIC:
+        for side in ("x", "y"):
+            assert isinstance(loaded[0][FIGURES[kind][side][0]], float)
 
 
 def test_dtype_table_is_consistent():
